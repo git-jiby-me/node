@@ -110,7 +110,7 @@ function render(lexed, filename, template, cb) {
 // for example, link man page references to the actual page
 function parseText(lexed) {
   lexed.forEach(function(tok) {
-    if (tok.text) {
+    if (tok.text && tok.type !== 'code') {
       tok.text = linkManPages(tok.text);
     }
   });
@@ -159,11 +159,11 @@ function parseLists(input) {
       }
       if (tok.type === 'list_end') {
         depth--;
+        output.push(tok);
         if (depth === 0) {
           state = null;
           output.push({ type:'html', text: '</div>' });
         }
-        output.push(tok);
         return;
       }
       if (tok.text) {

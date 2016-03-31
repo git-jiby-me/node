@@ -118,6 +118,7 @@ using v8::Locker;
 using v8::MaybeLocal;
 using v8::Message;
 using v8::Name;
+using v8::Null;
 using v8::Number;
 using v8::Object;
 using v8::ObjectTemplate;
@@ -148,6 +149,8 @@ static const char** preload_modules = nullptr;
 static bool use_debug_agent = false;
 static bool debug_wait_connect = false;
 static int debug_port = 5858;
+static const int v8_default_thread_pool_size = 4;
+static int v8_thread_pool_size = v8_default_thread_pool_size;
 static bool prof_process = false;
 static bool v8_is_profiling = false;
 static bool node_is_initialized = false;
@@ -170,6 +173,10 @@ bool enable_fips_crypto = false;
 bool force_fips_crypto = false;
 #endif
 
+// true if process warnings should be suppressed
+bool no_process_warnings = false;
+bool trace_warnings = false;
+
 // process-relative uptime base, initialized at start-up
 static double prog_start_time;
 static bool debugger_running;
@@ -177,7 +184,6 @@ static uv_async_t dispatch_debug_messages_async;
 
 static node::atomic<Isolate*> node_isolate;
 static v8::Platform* default_platform;
-
 
 static void PrintErrorString(const char* format, ...) {
   va_list ap;
@@ -955,7 +961,9 @@ Local<Value> WinapiErrnoException(Isolate* isolate,
 
 
 void* ArrayBufferAllocator::Allocate(size_t size) {
-  if (env_ == nullptr || !env_->array_buffer_allocator_info()->no_zero_fill())
+  if (env_ == nullptr ||
+      !env_->array_buffer_allocator_info()->no_zero_fill() ||
+      zero_fill_all_buffers)
     return calloc(size, 1);
   env_->array_buffer_allocator_info()->reset_fill_flag();
   return malloc(size);
@@ -1186,23 +1194,38 @@ Local<Value> MakeCallback(Environment* env,
   }
 
   if (ran_init_callback && !pre_fn.IsEmpty()) {
-    if (pre_fn->Call(object, 0, nullptr).IsEmpty())
-      FatalError("node::MakeCallback", "pre hook threw");
+    TryCatch try_catch(env->isolate());
+    MaybeLocal<Value> ar = pre_fn->Call(env->context(), object, 0, nullptr);
+    if (ar.IsEmpty()) {
+      ClearFatalExceptionHandlers(env);
+      FatalException(env->isolate(), try_catch);
+      return Local<Value>();
+    }
   }
 
   Local<Value> ret = callback->Call(recv, argc, argv);
 
   if (ran_init_callback && !post_fn.IsEmpty()) {
-    if (post_fn->Call(object, 0, nullptr).IsEmpty())
-      FatalError("node::MakeCallback", "post hook threw");
+    Local<Value> did_throw = Boolean::New(env->isolate(), ret.IsEmpty());
+    // Currently there's no way to retrieve an uid from node::MakeCallback().
+    // This needs to be fixed.
+    Local<Value> vals[] =
+        { Undefined(env->isolate()).As<Value>(), did_throw };
+    TryCatch try_catch(env->isolate());
+    MaybeLocal<Value> ar =
+        post_fn->Call(env->context(), object, ARRAY_SIZE(vals), vals);
+    if (ar.IsEmpty()) {
+      ClearFatalExceptionHandlers(env);
+      FatalException(env->isolate(), try_catch);
+      return Local<Value>();
+    }
   }
 
   if (ret.IsEmpty()) {
-    if (callback_scope.in_makecallback())
-      return ret;
-    // NOTE: Undefined() is returned here for backwards compatibility.
-    else
-      return Undefined(env->isolate());
+    // NOTE: For backwards compatibility with public API we return Undefined()
+    // if the top level call threw.
+    return callback_scope.in_makecallback() ?
+        ret : Undefined(env->isolate()).As<Value>();
   }
 
   if (has_domain) {
@@ -1215,7 +1238,23 @@ Local<Value> MakeCallback(Environment* env,
     }
   }
 
-  if (!env->KickNextTick(&callback_scope)) {
+  if (callback_scope.in_makecallback()) {
+    return ret;
+  }
+
+  Environment::TickInfo* tick_info = env->tick_info();
+
+  if (tick_info->length() == 0) {
+    env->isolate()->RunMicrotasks();
+  }
+
+  Local<Object> process = env->process_object();
+
+  if (tick_info->length() == 0) {
+    tick_info->set_index(0);
+  }
+
+  if (env->tick_callback_function()->Call(process, 0, nullptr).IsEmpty()) {
     return Undefined(env->isolate());
   }
 
@@ -2377,6 +2416,25 @@ void OnMessage(Local<Message> message, Local<Value> error) {
 }
 
 
+void ClearFatalExceptionHandlers(Environment* env) {
+  Local<Object> process = env->process_object();
+  Local<Value> events =
+      process->Get(env->context(), env->events_string()).ToLocalChecked();
+
+  if (events->IsObject()) {
+    events.As<Object>()->Set(
+        env->context(),
+        OneByteString(env->isolate(), "uncaughtException"),
+        Undefined(env->isolate())).FromJust();
+  }
+
+  process->Set(
+      env->context(),
+      env->domain_string(),
+      Undefined(env->isolate())).FromJust();
+}
+
+
 static void Binding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
@@ -3050,10 +3108,23 @@ void SetupProcessObject(Environment* env,
     READONLY_PROPERTY(process, "noDeprecation", True(env->isolate()));
   }
 
+  if (no_process_warnings) {
+    READONLY_PROPERTY(process, "noProcessWarnings", True(env->isolate()));
+  }
+
+  if (trace_warnings) {
+    READONLY_PROPERTY(process, "traceProcessWarnings", True(env->isolate()));
+  }
+
   // --throw-deprecation
   if (throw_deprecation) {
     READONLY_PROPERTY(process, "throwDeprecation", True(env->isolate()));
   }
+
+#ifdef NODE_NO_BROWSER_GLOBALS
+  // configure --no-browser-globals
+  READONLY_PROPERTY(process, "_noBrowserGlobals", True(env->isolate()));
+#endif  // NODE_NO_BROWSER_GLOBALS
 
   // --prof-process
   if (prof_process) {
@@ -3251,8 +3322,12 @@ void LoadEnvironment(Environment* env) {
 
   env->SetMethod(env->process_object(), "_rawDebug", RawDebug);
 
+  // Expose the global object as a property on itself
+  // (Allows you to set stuff on `global` from anywhere in JavaScript.)
+  global->Set(FIXED_ONE_BYTE_STRING(env->isolate(), "global"), global);
+
   Local<Value> arg = env->process_object();
-  f->Call(global, 1, &arg);
+  f->Call(Null(env->isolate()), ARRAY_SIZE(&arg), &arg);
 }
 
 static void PrintHelp();
@@ -3291,6 +3366,8 @@ static bool ParseDebugOpt(const char* arg) {
 }
 
 static void PrintHelp() {
+  // XXX: If you add an option here, please also add it to doc/node.1 and
+  // doc/api/cli.markdown
   printf("Usage: node [options] [ -e script | script.js ] [arguments] \n"
          "       node debug script.js [arguments] \n"
          "\n"
@@ -3303,16 +3380,21 @@ static void PrintHelp() {
          "                        does not appear to be a terminal\n"
          "  -r, --require         module to preload (option can be repeated)\n"
          "  --no-deprecation      silence deprecation warnings\n"
+         "  --trace-deprecation   show stack traces on deprecations\n"
          "  --throw-deprecation   throw an exception anytime a deprecated "
          "function is used\n"
-         "  --trace-deprecation   show stack traces on deprecations\n"
+         "  --no-warnings         silence all process warnings\n"
+         "  --trace-warnings      show stack traces on process warnings\n"
          "  --trace-sync-io       show stack trace when use of sync IO\n"
          "                        is detected after the first tick\n"
          "  --track-heap-objects  track heap object allocations for heap "
          "snapshots\n"
          "  --prof-process        process v8 profiler output generated\n"
          "                        using --prof\n"
+         "  --zero-fill-buffers   automatically zero-fill all newly allocated\n"
+         "                        Buffer and SlowBuffer instances\n"
          "  --v8-options          print v8 command line options\n"
+         "  --v8-pool-size=num    set v8's thread pool size\n"
 #if HAVE_OPENSSL
          "  --tls-cipher-list=val use an alternative default TLS cipher list\n"
 #if NODE_FIPS_MODE
@@ -3441,6 +3523,10 @@ static void ParseArgs(int* argc,
       force_repl = true;
     } else if (strcmp(arg, "--no-deprecation") == 0) {
       no_deprecation = true;
+    } else if (strcmp(arg, "--no-warnings") == 0) {
+      no_process_warnings = true;
+    } else if (strcmp(arg, "--trace-warnings") == 0) {
+      trace_warnings = true;
     } else if (strcmp(arg, "--trace-deprecation") == 0) {
       trace_deprecation = true;
     } else if (strcmp(arg, "--trace-sync-io") == 0) {
@@ -3455,9 +3541,13 @@ static void ParseArgs(int* argc,
     } else if (strcmp(arg, "--prof-process") == 0) {
       prof_process = true;
       short_circuit = true;
+    } else if (strcmp(arg, "--zero-fill-buffers") == 0) {
+      zero_fill_all_buffers = true;
     } else if (strcmp(arg, "--v8-options") == 0) {
       new_v8_argv[new_v8_argc] = "--help";
       new_v8_argc += 1;
+    } else if (strncmp(arg, "--v8-pool-size=", 15) == 0) {
+      v8_thread_pool_size = atoi(arg + 15);
 #if HAVE_OPENSSL
     } else if (strncmp(arg, "--tls-cipher-list=", 18) == 0) {
       default_cipher_list = arg + 18;
@@ -4277,8 +4367,7 @@ int Start(int argc, char** argv) {
   V8::SetEntropySource(crypto::EntropySource);
 #endif
 
-  const int thread_pool_size = 4;
-  default_platform = v8::platform::CreateDefaultPlatform(thread_pool_size);
+  default_platform = v8::platform::CreateDefaultPlatform(v8_thread_pool_size);
   V8::InitializePlatform(default_platform);
   V8::Initialize();
 
