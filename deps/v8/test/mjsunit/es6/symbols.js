@@ -25,7 +25,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --expose-gc --allow-natives-syntax --harmony-tostring
+// Flags: --expose-gc --allow-natives-syntax
 
 var symbols = []
 
@@ -441,8 +441,9 @@ TestGetOwnPropertySymbolsWithProto()
 
 function TestWellKnown() {
   var symbols = [
+    "hasInstance",
     // TODO(rossberg): reactivate once implemented.
-    // "hasInstance", "isConcatSpreadable", "isRegExp",
+    // "isConcatSpreadable", "isRegExp",
     "iterator", /* "toStringTag", */ "unscopables"
   ]
 

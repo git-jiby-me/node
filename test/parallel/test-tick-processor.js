@@ -18,7 +18,7 @@ common.refreshTmpDir();
 process.chdir(common.tmpDir);
 // Unknown checked for to prevent flakiness, if pattern is not found,
 // then a large number of unknown ticks should be present
-runTest(/LazyCompile.*\[eval\]:1|.*%  UNKNOWN/,
+runTest(/LazyCompile: \*f \[eval\]:1|.*%  UNKNOWN/,
   `function f() {
      for (var i = 0; i < 1000000; i++) {
        i++;
@@ -35,7 +35,7 @@ if (common.isWindows ||
   console.log('1..0 # Skipped: C++ symbols are not mapped for this os.');
   return;
 }
-runTest(/RunInDebugContext/,
+runTest(/runInDebugContext/,
   `function f() {
      require(\'vm\').runInDebugContext(\'Debug\');
      setImmediate(function() { f(); });
